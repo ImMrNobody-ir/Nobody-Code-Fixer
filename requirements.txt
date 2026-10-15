@@ -1,0 +1,5 @@
+aiogram>=3.13,<4
+aiohttp>=3.9
+aiohttp-socks>=0.9
+aiosqlite>=0.20
+python-dotenv>=1.0
