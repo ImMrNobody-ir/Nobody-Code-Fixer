@@ -6,12 +6,21 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
-RETRY_STATUSES = {429, 500, 502, 503, 504}
-MAX_ATTEMPTS = 3
+# Statuses that mean "this model is unavailable right now": retry once, then try the next model.
+SWITCH_STATUSES = {404, 429, 500, 502, 503, 504}
+ATTEMPTS_PER_MODEL = 2
 
 
 class LLMError(Exception):
-    """Raised when the model could not produce an answer."""
+    """Raised when the model could not produce an answer.
+
+    `switch_model` is True when trying another model may help
+    (model removed, overloaded, rate limited, network trouble).
+    """
+
+    def __init__(self, message: str, switch_model: bool = False):
+        super().__init__(message)
+        self.switch_model = switch_model
 
 
 class GeminiClient:
@@ -21,6 +30,7 @@ class GeminiClient:
         model: str,
         base_url: str,
         proxy: str | None = None,
+        fallback_models: list[str] | None = None,
         max_output_tokens: int = 4096,
     ):
         self.api_key = api_key
@@ -28,6 +38,8 @@ class GeminiClient:
         self.base_url = base_url.rstrip("/")
         self.proxy = proxy
         self.max_output_tokens = max_output_tokens
+        # Primary first, then fallbacks, without duplicates.
+        self.models = list(dict.fromkeys([model, *(fallback_models or [])]))
         self._session: aiohttp.ClientSession | None = None
 
     @property
@@ -51,6 +63,41 @@ class GeminiClient:
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+
+    async def _request(self, model: str, payload: dict) -> dict:
+        """Call one model, retrying briefly. Raises LLMError (switch_model=True if worth switching)."""
+        url = f"{self.base_url}/models/{model}:generateContent"
+        headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
+        session = await self._get_session()
+        last_error = "unknown error"
+
+        for attempt in range(1, ATTEMPTS_PER_MODEL + 1):
+            try:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    proxy=None if self._is_socks else self.proxy,
+                ) as resp:
+                    body = await resp.json(content_type=None)
+                    if resp.status == 200:
+                        return body
+                    message = ""
+                    if isinstance(body, dict):
+                        message = body.get("error", {}).get("message", "")
+                    last_error = f"HTTP {resp.status}: {message}"
+                    if resp.status not in SWITCH_STATUSES:
+                        raise LLMError(last_error)  # e.g. 400/401/403: another model won't help
+                    if resp.status == 404:
+                        raise LLMError(last_error, switch_model=True)  # no point retrying
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_error = f"network error: {exc!r}"
+
+            log.warning("Gemini %s attempt %s/%s failed: %s", model, attempt, ATTEMPTS_PER_MODEL, last_error)
+            if attempt < ATTEMPTS_PER_MODEL:
+                await asyncio.sleep(2 * attempt)
+
+        raise LLMError(last_error, switch_model=True)
 
     async def generate(
         self,
@@ -85,40 +132,25 @@ class GeminiClient:
                 "maxOutputTokens": self.max_output_tokens,
             },
         }
-        url = f"{self.base_url}/models/{self.model}:generateContent"
-        headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
 
-        session = await self._get_session()
         data: dict | None = None
-        last_error = "unknown error"
-
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        last_error: LLMError | None = None
+        for index, model in enumerate(self.models):
             try:
-                async with session.post(
-                    url,
-                    json=payload,
-                    headers=headers,
-                    proxy=None if self._is_socks else self.proxy,
-                ) as resp:
-                    body = await resp.json(content_type=None)
-                    if resp.status == 200:
-                        data = body
-                        break
-                    message = ""
-                    if isinstance(body, dict):
-                        message = body.get("error", {}).get("message", "")
-                    last_error = f"HTTP {resp.status}: {message}"
-                    if resp.status not in RETRY_STATUSES:
-                        raise LLMError(last_error)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                last_error = f"network error: {exc!r}"
-
-            log.warning("Gemini attempt %s/%s failed: %s", attempt, MAX_ATTEMPTS, last_error)
-            if attempt < MAX_ATTEMPTS:
-                await asyncio.sleep(2 * attempt)
+                data = await self._request(model, payload)
+            except LLMError as exc:
+                last_error = exc
+                if not exc.switch_model:
+                    raise
+                if index + 1 < len(self.models):
+                    log.warning("Model %s failed (%s); trying %s", model, exc, self.models[index + 1])
+                continue
+            if index > 0:
+                log.info("Answered by fallback model %s", model)
+            break
 
         if data is None:
-            raise LLMError(last_error)
+            raise last_error or LLMError("no model available")
 
         candidates = data.get("candidates") or []
         if not candidates:
