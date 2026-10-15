@@ -29,6 +29,7 @@ class Settings:
     bot_token: str
     gemini_api_key: str
     gemini_model: str
+    gemini_fallback_models: list[str]
     gemini_base_url: str
     proxy_url: str | None
     admin_ids: list[int]
@@ -58,7 +59,14 @@ def load_settings() -> Settings:
     return Settings(
         bot_token=token,
         gemini_api_key=api_key,
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip(),
+        gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip(),
+        gemini_fallback_models=[
+            m.strip()
+            for m in os.getenv(
+                "GEMINI_FALLBACK_MODELS", "gemini-3.6-flash,gemini-3.5-flash-lite"
+            ).split(",")
+            if m.strip()
+        ],
         gemini_base_url=os.getenv(
             "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"
         ).rstrip("/"),
