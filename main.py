@@ -36,6 +36,7 @@ async def main() -> None:
     llm = GeminiClient(
         api_key=settings.gemini_api_key,
         model=settings.gemini_model,
+        fallback_models=settings.gemini_fallback_models,
         base_url=settings.gemini_base_url,
         proxy=settings.proxy_url,
     )
